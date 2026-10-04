@@ -1,0 +1,451 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+: "${XDG_RUNTIME_DIR:?SomaFM Bar requires XDG_RUNTIME_DIR}"
+runtime_dir="$XDG_RUNTIME_DIR/somafm-bar"
+data_root=${XDG_DATA_HOME:-$HOME/.local/share}
+state_file="$data_root/somafm-bar/state.json"
+socket="$runtime_dir/mpvd.sock"
+status_file="$runtime_dir/status.json"
+pid_file="$runtime_dir/player.pid"
+log_file="$runtime_dir/mpv.log"
+max_json_bytes=4194304
+max_ipc_bytes=65536
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+status_script="$script_dir/player-status.lua"
+install -d -m 700 "$runtime_dir" "$data_root/somafm-bar"
+exec 8>"$runtime_dir/player.lock"
+
+station_url() {
+  local url
+  url=$(jq -r '.url // ""' "$script_dir/config.json" 2>/dev/null || true)
+  if [[ $url != http://* && $url != https://* ]]; then
+    url="http://ice6.somafm.com/bossa-128-mp3"
+  fi
+  printf '%s\n' "$url"
+}
+
+station_name() {
+  local name
+  name=$(jq -r '(.station // "") | if type == "string" then . else "" end' \
+    "$script_dir/config.json" 2>/dev/null || true)
+  name=$(printf '%s' "$name" | tr -d '[:cntrl:]' | cut -c1-80)
+  printf '%s\n' "${name:-SomaFM}"
+}
+
+player_idle() {
+  local response
+  response=$(printf '%s\n' '{"command":["get_property","idle-active"],"request_id":9002}' \
+    | socat -T 1 - "UNIX-CONNECT:$socket" 2>/dev/null \
+    | head -c "$((max_ipc_bytes + 1))") || return 1
+  (( $(printf '%s' "$response" | wc -c) <= max_ipc_bytes )) || return 1
+  jq -e 'select(.request_id == 9002 and .error == "success") | .data == true' \
+    <<< "$response" >/dev/null 2>&1
+}
+
+process_start_time() {
+  local pid=$1
+  [[ -r /proc/$pid/stat ]] || return 1
+  awk '$3 != "Z" { print $22 }' "/proc/$pid/stat" 2>/dev/null
+}
+
+player_alive() {
+  local pid expected_start actual_start
+  [[ -s $pid_file ]] || return 1
+  read -r pid expected_start < "$pid_file" || return 1
+  [[ $pid =~ ^[0-9]+$ && $expected_start =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  actual_start=$(process_start_time "$pid") || return 1
+  [[ $actual_start == "$expected_start" ]]
+}
+
+write_player_pid() {
+  local pid=$1
+  local start_time temporary
+  start_time=$(process_start_time "$pid") || return 1
+  temporary=$(mktemp "$runtime_dir/player.XXXXXX")
+  printf '%s %s\n' "$pid" "$start_time" > "$temporary"
+  mv "$temporary" "$pid_file"
+}
+
+cleanup_dead_player() {
+  player_alive && return
+  rm -f "$pid_file" "$socket"
+}
+
+terminate_tracked_player() {
+  local pid
+  player_alive || return 0
+  read -r pid _ < "$pid_file"
+  kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+  for _ in $(seq 1 100); do
+    player_alive || break
+    sleep 0.02
+  done
+  if player_alive; then
+    kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+    for _ in $(seq 1 50); do
+      player_alive || break
+      sleep 0.02
+    done
+  fi
+  player_alive && return 1
+  cleanup_dead_player
+}
+
+configured_number() {
+  local key=$1 default=$2
+  local value
+  value=$(jq -r --arg key "$key" --argjson default "$default" '
+    (.[$key] // $default | tonumber? // empty)
+    | if . < 0 then 0 elif . > 100 then 100 else . end' \
+    "$state_file" 2>/dev/null) || value=$default
+  printf '%s\n' "$value"
+}
+
+configured_volume() {
+  configured_number volume 70
+}
+
+configured_output() {
+  local output
+  output=$(jq -r '(.output // "") | if (type == "string"
+    and test("^([A-Za-z0-9._:+-]{0,160})$")) then . else "" end' \
+    "$state_file" 2>/dev/null) || output=""
+  printf '%s\n' "$output"
+}
+
+write_status() {
+  local state=$1
+  local temporary
+  if (( $(printf '%s' "$state" | wc -c) > max_ipc_bytes )); then
+    echo 'Soma player returned an oversized status' >&2
+    return 4
+  fi
+  temporary=$(mktemp "$runtime_dir/status.XXXXXX")
+  printf '%s\n' "$state" > "$temporary"
+  mv "$temporary" "$status_file"
+  printf '%s\n' "$state"
+}
+
+send_command() {
+  local payload=$1
+  local request_id=9001
+  local response
+  [[ -S $socket ]] || return 1
+  payload=$(jq -c --argjson requestId "$request_id" '. + {request_id: $requestId}' <<< "$payload") || return 1
+  response=$(printf '%s\n' "$payload" \
+    | socat -T 1 - "UNIX-CONNECT:$socket" 2>/dev/null \
+    | head -c "$((max_ipc_bytes + 1))") || return 1
+  (( $(printf '%s' "$response" | wc -c) <= max_ipc_bytes )) || return 1
+  jq -e --argjson requestId "$request_id" \
+    'select(.request_id == $requestId and .error == "success")' \
+    <<< "$response" >/dev/null 2>&1
+}
+
+not_running_status() {
+  jq -cn \
+    --argjson volume "$(configured_volume)" \
+    --arg output "$(configured_output)" \
+    --arg station "$(station_name)" \
+    '{running:false,paused:false,muted:false,title:"",volume:$volume,output:$output,loaded:false,error:"",errorDetail:"",station:{name:$station}}'
+}
+
+status() {
+  if [[ ! -S $socket ]]; then
+    cleanup_dead_player
+    write_status "$(not_running_status)"
+    return
+  fi
+
+  local response
+  response=$(
+    printf '%s\n' \
+      '{"command":["get_property","pause"],"request_id":1}' \
+      '{"command":["get_property","media-title"],"request_id":2}' \
+      '{"command":["get_property","volume"],"request_id":3}' \
+      '{"command":["get_property","mute"],"request_id":4}' \
+      '{"command":["get_property","audio-device"],"request_id":5}' \
+      '{"command":["get_property","idle-active"],"request_id":6}' \
+      | socat -T 1 - "UNIX-CONNECT:$socket" 2>/dev/null \
+      | head -c "$((max_ipc_bytes + 1))" || true
+  )
+  if (( $(printf '%s' "$response" | wc -c) > max_ipc_bytes )); then
+    response=""
+  fi
+
+  if ! jq -e 'select(.request_id == 1)' <<< "$response" >/dev/null 2>&1; then
+    cleanup_dead_player
+    write_status "$(not_running_status)"
+    return
+  fi
+
+  printf '%s\n' "$(jq -sc --arg station "$(station_name)" '
+    {
+      running: (([.[] | select(.request_id == 6) | .data][0] // false) == false),
+      paused: ([.[] | select(.request_id == 1) | .data][0] // false),
+      muted: ([.[] | select(.request_id == 4) | .data][0] // false),
+      title: (([.[] | select(.request_id == 2) | .data][0] // "")
+        | if type == "string" then gsub("[\\r\\n\\t]"; " ")[:512] else "" end),
+      volume: ([.[] | select(.request_id == 3) | .data][0] // 70),
+      output: (([.[] | select(.request_id == 5) | .data][0] // "")
+        | if type == "string" then (if . == "auto" then "" else sub("^pipewire/"; "") end) else "" end),
+      loaded: true,
+      error: "",
+      errorDetail: "",
+      station: {name: $station}
+    }' <<< "$response")"
+}
+
+player_command() {
+  local payload=$1
+  if ! send_command "$payload"; then
+    status >/dev/null
+    echo 'Soma player is unavailable' >&2
+    exit 4
+  fi
+  status
+}
+
+start_player() {
+  local url
+  url=$(station_url)
+  local -a player_arguments=(
+    mpv
+    --no-video
+    --force-window=no
+    --audio-display=no
+    --idle=yes
+    --cache-secs=20
+    --demuxer-max-bytes=8MiB
+    --demuxer-max-back-bytes=2MiB
+    --network-timeout=30
+    --volume="$(configured_volume)"
+    --volume-max=100
+    --input-ipc-server="$socket"
+    --script="$status_script"
+    --no-terminal
+    --really-quiet
+    "$url"
+  )
+  local selected_output
+  selected_output=$(configured_output)
+  if [[ -n $selected_output ]]; then
+    player_arguments+=(--audio-device="pipewire/$selected_output")
+  fi
+  rm -f "$socket"
+  SOMA_STATUS_FILE="$status_file" SOMA_STATION="$(station_name)" setsid "${player_arguments[@]}" \
+    > "$log_file" 2>&1 8>&- &
+  local player_pid=$!
+  if ! write_player_pid "$player_pid"; then
+    kill -- "-$player_pid" 2>/dev/null || kill "$player_pid" 2>/dev/null || true
+    wait "$player_pid" 2>/dev/null || true
+    rm -f "$socket"
+    echo 'Soma player could not start' >&2
+    exit 4
+  fi
+
+  for _ in $(seq 1 150); do
+    [[ -S $socket ]] && break
+    sleep 0.02
+  done
+  if [[ ! -S $socket ]]; then
+    terminate_tracked_player || true
+    wait "$player_pid" 2>/dev/null || true
+    rm -f "$socket"
+    echo 'Soma player could not start' >&2
+    exit 4
+  fi
+}
+
+reload_if_idle() {
+  player_idle || return 0
+  send_command "$(jq -cn --arg url "$(station_url)" '{command:["loadfile",$url,"replace"]}')" || true
+}
+
+play() {
+  if [[ ! -S $socket ]] && ! player_alive; then
+    start_player
+  fi
+  if ! reload_if_idle || ! send_command '{"command":["set_property","pause",false]}'; then
+    if [[ -S $socket ]] || player_alive; then
+      status >/dev/null
+      echo 'Soma player could not start playback' >&2
+      exit 4
+    fi
+    start_player
+    send_command '{"command":["set_property","pause",false]}' >/dev/null || {
+      status >/dev/null
+      echo 'Soma player could not start playback' >&2
+      exit 4
+    }
+  fi
+  status
+}
+
+stop_player() {
+  if [[ ! -S $socket ]]; then
+    if ! terminate_tracked_player; then
+      echo 'Soma player could not be stopped' >&2
+      exit 4
+    fi
+    status
+    return
+  fi
+
+  if ! send_command '{"command":["quit"]}'; then
+    if ! terminate_tracked_player; then
+      echo 'Soma player could not be stopped' >&2
+      exit 4
+    fi
+    status
+    return
+  fi
+
+  for _ in $(seq 1 100); do
+    if [[ ! -S $socket ]] && ! player_alive; then
+      break
+    fi
+    sleep 0.02
+  done
+  if { [[ -S $socket ]] || player_alive; } && ! terminate_tracked_player; then
+    echo 'Soma player could not be stopped' >&2
+    exit 4
+  fi
+  status
+}
+
+set_volume() {
+  local volume=${1:-}
+  [[ $volume =~ ^[0-9]+$ ]] || { echo 'Volume must be an integer from 0 to 100' >&2; exit 2; }
+  (( volume >= 0 && volume <= 100 )) || { echo 'Volume must be an integer from 0 to 100' >&2; exit 2; }
+  local temporary
+  temporary=$(mktemp "$runtime_dir/state.XXXXXX")
+  jq -S --argjson volume "$volume" '.volume = $volume' "$state_file" > "$temporary" 2>/dev/null \
+    || jq -S -n --argjson volume "$volume" '{volume: $volume}' > "$temporary"
+  mv "$temporary" "$state_file"
+
+  if [[ -S $socket ]]; then
+    local command
+    command=$(jq -cn --argjson volume "$volume" '{command:["set_property","volume",$volume]}')
+    if ! send_command "$command"; then
+      status >/dev/null
+      if [[ -S $socket ]]; then
+        echo 'Soma volume could not be changed' >&2
+        exit 4
+      fi
+    fi
+  fi
+  status
+}
+
+adjust_volume() {
+  local delta=$1
+  local current
+  current=$(status | jq -r '.volume | round')
+  local next=$((current + delta))
+  (( next < 0 )) && next=0
+  (( next > 100 )) && next=100
+  set_volume "$next"
+}
+
+list_outputs() {
+  local sinks
+  sinks=$(pactl -f json list sinks 2>/dev/null) || {
+    echo 'Audio outputs are unavailable' >&2
+    exit 3
+  }
+  if (( $(printf '%s' "$sinks" | wc -c) > max_json_bytes )) \
+    || ! jq -e 'type == "array"' <<< "$sinks" >/dev/null 2>&1; then
+    echo 'Audio outputs are unavailable' >&2
+    exit 3
+  fi
+  printf '%s' "$sinks" | jq -c '[
+    .[] | select(type == "object" and (.name | type == "string"))
+    | .name as $id
+    | select($id | test("^([A-Za-z0-9._:+-]{1,160})$"))
+    | {id: $id, label: ((.description // $id) | tostring | gsub("[\\r\\n\\t]"; " ") | .[:160])}
+  ] | {outputs: .}'
+}
+
+set_output() {
+  local requested=${1-}
+  if [[ -n $requested ]]; then
+    [[ $requested =~ ^[A-Za-z0-9._:+-]{1,160}$ ]] || {
+      echo 'Unknown audio output' >&2
+      exit 2
+    }
+    local available
+    available=$(list_outputs)
+    jq -e --arg requested "$requested" 'any(.outputs[]; .id == $requested)' \
+      <<< "$available" >/dev/null || {
+      echo 'Unknown audio output' >&2
+      exit 3
+    }
+  fi
+
+  local temporary
+  temporary=$(mktemp "$runtime_dir/state.XXXXXX")
+  jq -S --arg output "$requested" '.output = $output' "$state_file" > "$temporary" 2>/dev/null \
+    || jq -S -n --arg output "$requested" '{output: $output}' > "$temporary"
+  mv "$temporary" "$state_file"
+
+  if [[ -S $socket ]]; then
+    local device command
+    device=auto
+    [[ -z $requested ]] || device="pipewire/$requested"
+    command=$(jq -cn --arg device "$device" '{command:["set_property","audio-device",$device]}')
+    if ! send_command "$command"; then
+      status >/dev/null
+      if [[ -S $socket ]]; then
+        echo 'Audio output could not be changed' >&2
+        exit 4
+      fi
+    fi
+  fi
+  status
+}
+
+action=${1:-status}
+[[ $action == play || $action == outputs ]] || flock -x 8
+case "$action" in
+  play)
+    play
+    ;;
+  toggle)
+    if player_idle; then
+      play
+    else
+      player_command '{"command":["cycle","pause"]}'
+    fi
+    ;;
+  pause)
+    player_command '{"command":["set_property","pause",true]}'
+    ;;
+  stop)
+    stop_player
+    ;;
+  volume)
+    set_volume "${2:-}"
+    ;;
+  volume-up)
+    adjust_volume 5
+    ;;
+  volume-down)
+    adjust_volume -5
+    ;;
+  outputs)
+    list_outputs
+    ;;
+  output)
+    set_output "${2-}"
+    ;;
+  status)
+    status
+    ;;
+  *)
+    echo "Unknown action: $action" >&2
+    exit 2
+    ;;
+esac
