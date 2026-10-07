@@ -10,6 +10,14 @@ local write_timer = nil
 
 local station = (os.getenv('SOMA_STATION') or 'SomaFM'):gsub('[%c]', ' '):sub(1, 80)
 
+local function current_output()
+  local device = mp.get_property('audio-device') or ''
+  if device == '' or device == 'auto' then
+    return ''
+  end
+  return (device:gsub('^pipewire/', ''))
+end
+
 local function do_write()
   write_timer = nil
   local data = {
@@ -18,6 +26,7 @@ local function do_write()
     muted = mp.get_property_bool('mute'),
     volume = mp.get_property_number('volume') or 70,
     title = tostring(mp.get_property('media-title') or ''):gsub('[%c]', ' '),
+    output = current_output(),
     error = '',
     errorDetail = '',
     station = { name = station }
@@ -50,4 +59,5 @@ mp.observe_property('pause', 'bool', schedule)
 mp.observe_property('mute', 'bool', schedule)
 mp.observe_property('volume', 'number', schedule)
 mp.observe_property('idle-active', 'bool', schedule)
+mp.observe_property('audio-device', 'string', schedule)
 schedule()

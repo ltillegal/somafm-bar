@@ -22,6 +22,10 @@ BarWidget {
   property int pendingVolume: -1
   property bool statusReady: false
 
+  property var audioOutputs: []
+  property string audioOutput: ""
+  property string outputsBuffer: ""
+
   readonly property string playerPath: Qt.resolvedUrl("player").toString().replace(/^file:\/\//, "")
   readonly property string statusPath: Quickshell.env("XDG_RUNTIME_DIR") + "/somafm-bar/status.json"
 
@@ -31,6 +35,11 @@ BarWidget {
 
   function safeTooltipText(value) {
     return root.singleLineText(value, 160).replace(/</g, "‹").replace(/>/g, "›")
+  }
+
+  function outputLabel(value) {
+    var label = root.singleLineText(value, 80)
+    return label.length > 30 ? label.slice(0, 29) + "…" : label
   }
 
   function applyPlayerState(raw) {
@@ -46,6 +55,7 @@ BarWidget {
       if (root.pendingVolume < 0) root.playerVolume = root.reportedVolume
       root.playerTitle = root.singleLineText(
         state.title || "", 160)
+      root.audioOutput = root.singleLineText(state.output, 160)
       var station = root.singleLineText(state.station && state.station.name, 80)
       if (station !== "") root.stationName = station
     } catch (error) {
@@ -65,6 +75,21 @@ BarWidget {
     actionProcess.running = true
   }
 
+  function loadOutputs() {
+    if (outputsProcess.running) return
+    root.outputsBuffer = ""
+    outputsProcess.command = [root.playerPath, "outputs"]
+    outputsProcess.running = true
+  }
+
+  function selectOutput(id) {
+    if (typeof id !== "string" || id === "") return
+    if (id === root.audioOutput) return
+    if (outputProcess.running) return
+    outputProcess.command = [root.playerPath, "output", id]
+    outputProcess.running = true
+  }
+
   function changeVolume(delta) {
     var current = pendingVolume >= 0 ? pendingVolume : playerVolume
     pendingVolume = Math.max(0, Math.min(100, current + (delta > 0 ? 5 : -5)))
@@ -82,6 +107,7 @@ BarWidget {
   function open() {
     root.opened = true
     root.refreshStatus()
+    root.loadOutputs()
   }
 
   function close() {
@@ -150,7 +176,50 @@ BarWidget {
     }
   }
 
-  Component.onCompleted: root.refreshStatus()
+  Process {
+    id: outputsProcess
+    command: []
+    stdout: SplitParser {
+      onRead: function(line) { root.outputsBuffer += line }
+    }
+    onExited: function(exitCode) {
+      var buffer = root.outputsBuffer
+      root.outputsBuffer = ""
+      if (exitCode !== 0) return
+      var list = []
+      try {
+        var parsed = JSON.parse(buffer || "{}")
+        var items = parsed && parsed.outputs
+        if (items && typeof items.length === "number") {
+          for (var i = 0; i < items.length; i++) {
+            var item = items[i]
+            if (!item || typeof item.id !== "string" || item.id === "") continue
+            list.push({
+              id: item.id,
+              label: root.singleLineText(item.label || item.id, 80)
+            })
+          }
+        }
+      } catch (error) {
+        return
+      }
+      root.audioOutputs = list
+    }
+  }
+
+  Process {
+    id: outputProcess
+    command: []
+    onExited: function(exitCode) {
+      if (exitCode === 0) root.loadOutputs()
+      root.refreshStatus()
+    }
+  }
+
+  Component.onCompleted: {
+    root.refreshStatus()
+    root.loadOutputs()
+  }
 
   Timer {
     id: closeTimer
@@ -284,6 +353,36 @@ iconText: root.playerRunning && !root.playerPaused ? "\uf04c" : "\uf04b"
           }
           onReleased: root.flushVolume()
           onRightClicked: root.runPlayerAction(root.playerRunning ? "toggle" : "play")
+        }
+
+        Column {
+          id: outputColumn
+          width: popupColumn.width
+          spacing: Style.spacing.controlGap
+          visible: root.audioOutputs.length > 0
+
+          Text {
+            width: outputColumn.width
+            text: "Output"
+            textFormat: Text.PlainText
+            color: Color.foreground
+            opacity: 0.65
+            font.family: Style.font.family
+            font.pixelSize: Style.font.bodySmall
+            elide: Text.ElideRight
+          }
+
+          Repeater {
+            model: root.audioOutputs
+            delegate: Button {
+              width: outputColumn.width
+              text: root.outputLabel(modelData.label)
+              leftAlign: true
+              selected: modelData.id === root.audioOutput
+              tooltipText: root.safeTooltipText(modelData.label)
+              onClicked: root.selectOutput(modelData.id)
+            }
+          }
         }
       }
     }

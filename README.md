@@ -8,11 +8,13 @@ Bar widget for [Omarchy](https://omarchy.org/) that plays a SomaFM station throu
 
 - A note icon in the bar, lit while the station is playing.
 - Left-click opens the popup card under the icon — nothing starts playing until you press **Play**.
-- Popup card: current track title, Play/Pause, Stop, and a volume slider.
+- Popup card: current track title, Play/Pause, Stop, a volume slider, and the list of audio outputs.
 - Copy button next to the title puts the current track title on the clipboard and closes the card.
 - Right-click the bar icon stops playback, middle-click toggles play/pause, scroll wheel changes volume in 5% steps.
 - The popup closes on outside click or `Esc`.
 - Volume and audio output are remembered between sessions.
+
+Every PipeWire sink shows up in the **Output** list of the card, so the stream can go to the built-in speakers, headphones or a network device such as an AirPlay speaker (Sonos, HomePod, Apple TV). Selecting a row switches playback immediately while the stream keeps playing.
 
 ## Requirements
 
@@ -70,6 +72,19 @@ Playback volume and audio output live outside the repository and are stored per 
 
 - `$XDG_RUNTIME_DIR/somafm-bar/` — mpv IPC socket, player pid, `status.json`, `mpv.log`
 - `$XDG_DATA_HOME/somafm-bar/state.json` — remembered volume and output
+
+### Audio output
+
+The **Output** list in the popup card picks the PipeWire sink. The same switch works headlessly with the `player` script in this folder:
+
+```bash
+./player outputs     # id + label of every PipeWire sink
+./player output <id> # switch, e.g. ./player output raop_sink.Mac-Ludens.local.192.168.0.111.7000
+./player output      # go back to the system default
+```
+
+Network sinks such as AirPlay speakers show up once `pipewire-zeroconf` and the `raop-discover` module are configured — see the
+[omacom/omarchy AirPlay guide](https://github.com/omacom/omarchy/discussions/3943).
 
 ## Keyboard shortcut
 
