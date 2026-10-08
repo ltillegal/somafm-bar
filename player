@@ -34,6 +34,44 @@ station_name() {
   printf '%s\n' "${name:-SomaFM}"
 }
 
+override_file="$data_root/somafm-bar/override.json"
+channels_cache="$data_root/somafm-bar/channels-cache.json"
+favorites_file="$data_root/somafm-bar/favorites.json"
+
+load_override() {
+  [[ -f $override_file ]] || return 0
+  jq -e '.url|type=="string"' "$override_file" >/dev/null 2>&1 || return 0
+  jq -e '.name|type=="string"' "$override_file" >/dev/null 2>&1 || return 0
+}
+
+station_url() {
+  load_override || true
+  local url
+  if [[ -f $override_file ]]; then
+    url=$(jq -r '.url // ""' "$override_file" 2>/dev/null || true)
+  fi
+  if [[ -z $url || ($url != http://* && $url != https://*) ]]; then
+    url=$(jq -r '.url // ""' "$script_dir/config.json" 2>/dev/null || true)
+  fi
+  if [[ $url != http://* && $url != https://* ]]; then
+    url="http://ice6.somafm.com/bossa-128-mp3"
+  fi
+  printf '%s\n' "$url"
+}
+
+station_name() {
+  load_override || true
+  local name=""
+  if [[ -f $override_file ]]; then
+    name=$(jq -r '(.name // "") | if type == "string" then . else "" end' "$override_file" 2>/dev/null || true)
+  fi
+  if [[ -z $name ]]; then
+    name=$(jq -r '(.station // "") | if type == "string" then . else "" end' "$script_dir/config.json" 2>/dev/null || true)
+  fi
+  name=$(printf '%s' "$name" | tr -d '[:cntrl:]' | cut -c1-80)
+  printf '%s\n' "${name:-SomaFM}"
+}
+
 player_idle() {
   local response
   response=$(printf '%s\n' '{"command":["get_property","idle-active"],"request_id":9002}' \
@@ -409,6 +447,104 @@ set_output() {
 
 action=${1:-status}
 [[ $action == play || $action == outputs ]] || flock -x 8
+
+
+
+fetch_stations_json() {
+  local now ttl=3600
+  now=$(date +%s 2>/dev/null || echo 0)
+  if [[ -f $channels_cache ]]; then
+    local mtime
+    mtime=$(stat -c %Y "$channels_cache" 2>/dev/null || echo 0)
+    if (( now - mtime < ttl )); then
+      cat "$channels_cache"
+      return 0
+    fi
+  fi
+  local tmp
+  tmp=$(mktemp "$data_root/somafm-bar/ch.XXXXXX.json")
+  if curl -s --max-time 25 "https://somafm.com/channels.json" > "$tmp" 2>/dev/null; then
+    if jq -e 'has("channels") and (.channels|type=="array")' "$tmp" >/dev/null 2>&1; then
+      mv "$tmp" "$channels_cache"
+      cat "$channels_cache"
+      return 0
+    fi
+  fi
+  rm -f "$tmp"
+  [[ -f $channels_cache ]] && cat "$channels_cache" || echo '{"channels":[]}'
+}
+
+normalize_stations() {
+  fetch_stations_json | jq -c '
+    [.channels[] | select(type=="object") | .id as $id | .title as $title | .description as $desc |
+      (try (.playlists[] | select(.format|tostring|contains("mp3"))) catch null) as $p |
+      ($p // {}) as $pl |
+      ($id|tostring|gsub("[[:space:]]+";"")) as $sid |
+      (if ($pl.url|type=="string") then $pl.url else ("https://ice2.somafm.com/"+$sid+"-128-mp3") end) as $url |
+      select($url|test("^https?://")) |
+      {
+        id: $sid,
+        name: ($title|tostring|gsub("[\\r\\n\\t]";" ")|.[0:120]),
+        title: ($title|tostring|gsub("[\\r\\n\\t]";" ")|.[0:120]),
+        description: ($desc|tostring|gsub("[\\r\\n\\t]";" ")|.[0:400]),
+        url: $url
+      }
+    ] | unique_by(.url) | sort_by(.name)'
+}
+
+stations_cmd() {
+  normalize_stations
+}
+
+fav_ensure() {
+  [[ -f $favorites_file ]] || echo '{"stations":[]}' > "$favorites_file"
+  jq -e '.stations|type=="array"' "$favorites_file" >/dev/null 2>&1 || echo '{"stations":[]}' > "$favorites_file"
+}
+
+fav_list() {
+  fav_ensure
+  jq -c '.stations' "$favorites_file"
+}
+
+fav_add() {
+  local name=${1-} url=${2-}
+  [[ -n $name && -n $url ]] || { echo 'Invalid favorite' >&2; exit 2; }
+  fav_ensure
+  local tmp
+  tmp=$(mktemp "$data_root/somafm-bar/fav.XXXXXX.json")
+  jq --arg n "$name" --arg u "$url" '.stations |= ([{name:$n,url:$u}] + map(select(.url != $u))) | .stations |= .[0:200]' "$favorites_file" > "$tmp"
+  mv "$tmp" "$favorites_file"
+  fav_list
+}
+
+fav_remove() {
+  local url=${1-}
+  [[ -n $url ]] || { echo 'Invalid favorite' >&2; exit 2; }
+  fav_ensure
+  local tmp
+  tmp=$(mktemp "$data_root/somafm-bar/fav.XXXXXX.json")
+  jq --arg u "$url" '.stations |= map(select(.url != $u))' "$favorites_file" > "$tmp"
+  mv "$tmp" "$favorites_file"
+  fav_list
+}
+
+switch_station() {
+  local name=${1-} url=${2-}
+  [[ -n $name && -n $url ]] || { echo 'Invalid station' >&2; exit 2; }
+  [[ $url == http://* || $url == https://* ]] || { echo 'Invalid URL' >&2; exit 2; }
+  local tmp
+  tmp=$(mktemp "$data_root/somafm-bar/ovr.XXXXXX.json")
+  jq -n --arg n "$name" --arg u "$url" '{name:$n,url:$u}' > "$tmp"
+  mv "$tmp" "$override_file"
+  if [[ -S $socket ]]; then
+    reload_if_idle || send_command "$(jq -cn --arg url "$url" '{command:["loadfile",$url,"replace"]}')" >/dev/null 2>&1 || true
+    send_command '{"command":["set_property","pause",false]}' >/dev/null 2>&1 || true
+  else
+    player_alive || true
+  fi
+  SOMA_STATION="$(station_name)" status >/dev/null 2>&1 || status
+}
+
 case "$action" in
   play)
     play
@@ -443,6 +579,24 @@ case "$action" in
     ;;
   status)
     status
+    ;;
+  stations)
+    stations_cmd
+    ;;
+  fav-list)
+    fav_list
+    ;;
+  fav-add)
+    fav_add "${2-}" "${3-}"
+    ;;
+  fav-remove)
+    fav_remove "${2-}"
+    ;;
+  switch)
+    switch_station "${2-}" "${3-}"
+    ;;
+  set-station)
+    switch_station "${2-}" "${3-}"
     ;;
   *)
     echo "Unknown action: $action" >&2

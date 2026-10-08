@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -25,6 +26,14 @@ BarWidget {
   property var audioOutputs: []
   property string audioOutput: ""
   property string outputsBuffer: ""
+
+  property var allStations: []
+  property var favStations: []
+  property string stationsBuffer: ""
+  property string favsBuffer: ""
+  property string searchText: ""
+  property bool stationsLoaded: false
+  property bool favsLoaded: false
 
   readonly property string playerPath: Qt.resolvedUrl("player").toString().replace(/^file:\/\//, "")
   readonly property string statusPath: Quickshell.env("XDG_RUNTIME_DIR") + "/somafm-bar/status.json"
@@ -69,6 +78,20 @@ BarWidget {
     statusProcess.running = true
   }
 
+  function loadStations() {
+    if (stationsProcess.running) return
+    root.stationsBuffer = ""
+    stationsProcess.command = [root.playerPath, "stations"]
+    stationsProcess.running = true
+  }
+
+  function loadFavs() {
+    if (favsProcess.running) return
+    root.favsBuffer = ""
+    favsProcess.command = [root.playerPath, "fav-list"]
+    favsProcess.running = true
+  }
+
   function runPlayerAction(action) {
     if (actionProcess.running) return
     actionProcess.command = [root.playerPath, action]
@@ -108,12 +131,53 @@ BarWidget {
     root.opened = true
     root.refreshStatus()
     root.loadOutputs()
+    root.loadStations()
+    root.loadFavs()
+    root.searchText = ""
   }
 
   function close() {
     root.opened = false
   }
 
+  function isFavorite(url) {
+    for (var i = 0; i < root.favStations.length; i++) {
+      if (root.favStations[i].url === url) return true
+    }
+    return false
+  }
+
+  function toggleFavorite(station) {
+    if (!station || typeof station.url !== "string") return
+    if (favToggleProcess.running) return
+    if (isFavorite(station.url)) {
+      favToggleProcess.command = [root.playerPath, "fav-remove", station.url]
+    } else {
+      favToggleProcess.command = [root.playerPath, "fav-add", station.name, station.url]
+    }
+    favToggleProcess.running = true
+  }
+
+  function switchStation(station) {
+    if (!station || typeof station.url !== "string") return
+    if (switchProcess.running) return
+    switchProcess.command = [root.playerPath, "switch", station.name, station.url]
+    switchProcess.running = true
+    Qt.callLater(root.refreshStatus)
+  }
+
+  function filteredStations() {
+    var q = (root.searchText || "").toLowerCase()
+    var list = root.allStations
+    if (!q) return list.slice(0, 200)
+    var res = []
+    for (var i = 0; i < list.length && res.length < 200; i++) {
+      var s = list[i]
+      var t = ((s.name||"") + " " + (s.title||"") + " " + (s.description||"")).toLowerCase()
+      if (t.indexOf(q) >= 0) res.push(s)
+    }
+    return res
+  }
   function toggle() {
     if (root.opened) root.close()
     else root.open()
@@ -216,9 +280,90 @@ BarWidget {
     }
   }
 
+  Process {
+    id: stationsProcess
+    command: []
+    stdout: SplitParser {
+      onRead: function(line) { root.stationsBuffer += line }
+    }
+    onExited: function(exitCode) {
+      var buffer = root.stationsBuffer
+      root.stationsBuffer = ""
+      if (exitCode !== 0) return
+      try {
+        var parsed = JSON.parse(buffer || "[]")
+        if (parsed && typeof parsed.length === "number") {
+          var list = []
+          for (var i = 0; i < parsed.length; i++) {
+            var s = parsed[i]
+            if (!s || typeof s.url !== "string") continue
+            list.push({
+              id: s.id || s.url,
+              name: root.singleLineText(s.name || s.title || "Station", 120),
+              url: s.url,
+              title: root.singleLineText(s.title || s.name || "", 120),
+              description: root.singleLineText(s.description || "", 200)
+            })
+          }
+          root.allStations = list
+          root.stationsLoaded = true
+        }
+      } catch (e) {}
+    }
+  }
+
+  Process {
+    id: favsProcess
+    command: []
+    stdout: SplitParser {
+      onRead: function(line) { root.favsBuffer += line }
+    }
+    onExited: function(exitCode) {
+      var buffer = root.favsBuffer
+      root.favsBuffer = ""
+      if (exitCode !== 0) return
+      try {
+        var parsed = JSON.parse(buffer || "[]")
+        if (parsed && typeof parsed.length === "number") {
+          var list = []
+          for (var i = 0; i < parsed.length; i++) {
+            var s = parsed[i]
+            if (!s || typeof s.url !== "string") continue
+            list.push({
+              id: s.url,
+              name: root.singleLineText(s.name || "Station", 120),
+              url: s.url
+            })
+          }
+          root.favStations = list
+          root.favsLoaded = true
+        }
+      } catch (e) {}
+    }
+  }
+
+  Process {
+    id: switchProcess
+    command: []
+    onExited: function(exitCode) {
+      root.refreshStatus()
+      root.loadFavs()
+    }
+  }
+
+  Process {
+    id: favToggleProcess
+    command: []
+    onExited: function(exitCode) {
+      root.loadFavs()
+    }
+  }
+
   Component.onCompleted: {
     root.refreshStatus()
     root.loadOutputs()
+    root.loadStations()
+    root.loadFavs()
   }
 
   Timer {
@@ -381,6 +526,140 @@ iconText: root.playerRunning && !root.playerPaused ? "\uf04c" : "\uf04b"
               selected: modelData.id === root.audioOutput
               tooltipText: root.safeTooltipText(modelData.label)
               onClicked: root.selectOutput(modelData.id)
+            }
+          }
+        }
+        
+        Column {
+          id: stationsColumn
+          width: popupColumn.width
+          spacing: Style.spacing.controlGap
+          visible: root.stationsLoaded
+
+          Text {
+            width: stationsColumn.width
+            text: "Stations"
+            textFormat: Text.PlainText
+            color: Color.foreground
+            opacity: 0.65
+            font.family: Style.font.family
+            font.pixelSize: Style.font.bodySmall
+            elide: Text.ElideRight
+          }
+
+          TextField {
+            width: stationsColumn.width
+            placeholderText: "Search stations..."
+            text: root.searchText
+            onTextChanged: root.searchText = text
+          }
+
+          Column {
+            width: stationsColumn.width
+            spacing: Style.spacing.controlGap
+            visible: root.favStations.length > 0
+
+            Text {
+              width: parent.width
+              text: "Favorites"
+              textFormat: Text.PlainText
+              color: Color.foreground
+              opacity: 0.5
+              font.family: Style.font.family
+              font.pixelSize: Style.font.bodySmall
+              elide: Text.ElideRight
+            }
+
+            ScrollView {
+              width: stationsColumn.width
+              implicitHeight: Math.min(root.favStations.length * 40, 200)
+              clip: true
+              Flickable {
+                anchors.fill: parent
+                contentWidth: width
+                contentHeight: favCol.height
+                interactive: true
+                flickableDirection: Flickable.VerticalFlick
+                Column {
+                  id: favCol
+                  width: parent.width
+                  spacing: Style.spacing.controlGap
+                  Repeater {
+                    model: root.favStations
+                    delegate: Row {
+                      width: parent.width
+                      spacing: Style.spacing.controlGap
+                      Button {
+                        width: parent.width - favBtn.width - parent.spacing
+                        text: root.singleLineText(modelData.name, 60)
+                        leftAlign: true
+                        onClicked: root.switchStation(modelData)
+                      }
+                      PanelActionButton {
+                        id: favBtn
+                        iconText: "\uf005"
+                        tooltipText: "Remove from favorites"
+                        onClicked: root.toggleFavorite(modelData)
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+          Column {
+            width: stationsColumn.width
+            spacing: Style.spacing.controlGap
+            visible: root.filteredStations().length > 0
+
+            Text {
+              width: parent.width
+              text: root.searchText === "" ? "All stations" : "Search results"
+              textFormat: Text.PlainText
+              color: Color.foreground
+              opacity: 0.5
+              font.family: Style.font.family
+              font.pixelSize: Style.font.bodySmall
+              elide: Text.ElideRight
+            }
+
+            ScrollView {
+              width: stationsColumn.width
+              implicitHeight: Math.min(root.filteredStations().length * 40, 240)
+              clip: true
+              Flickable {
+                anchors.fill: parent
+                contentWidth: width
+                contentHeight: allCol.height
+                interactive: true
+                flickableDirection: Flickable.VerticalFlick
+                Column {
+                  id: allCol
+                  width: parent.width
+                  spacing: Style.spacing.controlGap
+                  Repeater {
+                    model: root.filteredStations()
+                    delegate: Row {
+                      width: parent.width
+                      spacing: Style.spacing.controlGap
+                      Button {
+                        width: parent.width - favBtn2.width - parent.spacing
+                        text: root.singleLineText(modelData.name, 60)
+                        leftAlign: true
+                        tooltipText: root.safeTooltipText(modelData.description)
+                        onClicked: root.switchStation(modelData)
+                      }
+                      PanelActionButton {
+                        id: favBtn2
+                        iconText: root.isFavorite(modelData.url) ? "\uf005" : "\uf006"
+                        tooltipText: root.isFavorite(modelData.url) ? "Remove from favorites" : "Add to favorites"
+                        onClicked: root.toggleFavorite(modelData)
+                      }
+                    }
+                  }
+                }
+              }
             }
           }
         }
