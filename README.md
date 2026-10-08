@@ -86,6 +86,25 @@ The **Output** list in the popup card picks the PipeWire sink. The same switch w
 Network sinks such as AirPlay speakers show up once `pipewire-zeroconf` and the `raop-discover` module are configured — see the
 [omacom/omarchy AirPlay guide](https://github.com/omacom/omarchy/discussions/3943).
 
+
+## Stations & Favorites
+
+The popup card now includes a searchable station list with favorites:
+
+- **Favorites** — scrollable list of your saved stations. Click a favorite to switch instantly. Click the star to remove it.
+- **All Stations / Search results** — scrollable list pulled live from SomaFM (cached for 1 hour). Type in "Search stations..." to filter by name/description. Click the star to add/remove from favorites.
+- Stations are switched directly from the popup (the card stays responsive while switching).
+
+Manage favorites headlessly with the player script:
+
+```bash
+./player stations     # list all SomaFM stations (JSON)
+./player fav-list     # list favorites (JSON)
+./player fav-add "Station Name" "http://..."  # add favorite
+./player fav-remove "http://..."              # remove by URL
+./player switch "Station Name" "http://..."   # switch station
+```
+
 ## Keyboard shortcut
 
 Optional. The widget ships an IPC target, so any toggle works. Add to `~/.config/hypr/bindings.lua` and run `hyprctl reload`:
