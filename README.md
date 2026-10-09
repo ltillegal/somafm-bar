@@ -14,7 +14,7 @@ Bar widget for [Omarchy](https://omarchy.org/) that plays a SomaFM station throu
 - The popup closes on outside click or `Esc`.
 - Volume and audio output are remembered between sessions.
 
-Every PipeWire sink shows up in the **Output** list of the card, so the stream can go to the built-in speakers, headphones or a network device such as an AirPlay speaker (Sonos, HomePod, Apple TV). Selecting a row switches playback immediately while the stream keeps playing.
+Every PipeWire sink shows up in the **Output** list of the card, so the stream can go to the built-in speakers, headphones or a network device such as an AirPlay speaker (Sonos, HomePod, Apple TV). AirPlay 2 receivers configured in `airplay.json` also appear as a dedicated **AirPlay 2 (<name>)** output. Selecting a row switches playback immediately while the stream keeps playing.
 
 ## Requirements
 
@@ -27,8 +27,9 @@ External commands used by the plugin (all in the Arch `extra`/`multilib` reposit
 | `socat` | `socat` | talking to the `mpv` IPC socket |
 | `wl-copy` | `wl-clipboard` | the copy-title button |
 | `pactl` | `pipewire-pulse` (or `pipewire-utils`) | listing audio outputs |
+| `python3` | `python` | reading AirPlay 2 receiver features (optional) |
 
-Omarchy itself already provides `mpv` and PipeWire on most installations. `mpv` is started with `--audio-display=no`, so the stream never produces a video window.
+Omarchy itself already provides `mpv` and PipeWire on most installations. `mpv` is started with `--audio-display=no`, so the stream never produces a video window. The AirPlay 2 output additionally needs the `cliairplay` sender (see [AirPlay 2 output](#airplay-2-output)).
 
 ## Install
 
@@ -79,13 +80,52 @@ The **Output** list in the popup card picks the PipeWire sink. The same switch w
 
 ```bash
 ./player outputs     # id + label of every PipeWire sink
-./player output <id> # switch, e.g. ./player output raop_sink.Mac-Ludens.local.192.168.0.111.7000
+./player output <id> # switch, e.g. ./player output alsa_output.pci-0000_00_1b.0.analog-stereo
 ./player output      # go back to the system default
 ```
 
-Network sinks such as AirPlay speakers show up once `pipewire-zeroconf` and the `raop-discover` module are configured — see the
+Legacy AirPlay 1 / RAOP sinks such as Sonos show up once `pipewire-zeroconf` and the `raop-discover` module are configured — see the
 [omacom/omarchy AirPlay guide](https://github.com/omacom/omarchy/discussions/3943).
 
+### AirPlay 2 output
+
+Newer Apple receivers (macOS Ventura and later, HomePod, Apple TV) refuse the legacy RAOP/AirPlay 1 handshake and answer `403 Forbidden`. For those the plugin ships a dedicated AirPlay 2 output driven by the `cliairplay` AirPlay 2 sender.
+
+It creates a private PipeWire null-sink named after the target and pipes that sink's monitor into `cliairplay`, so playback, pause/resume, volume and output switching behave like any other sink. The session is always torn down with a graceful AirPlay `STOP`.
+
+Requirements:
+
+- `python3` — used to read the receiver's `GET /info` `features`; optional, falls back to the `txt` field below.
+- `cliairplay` on `PATH`, with permission to bind the PTP ports:
+
+```bash
+sudo setcap cap_net_bind_service=+ep "$(command -v cliairplay)"
+```
+
+Configure one or more targets in `$XDG_DATA_HOME/somafm-bar/airplay.json`:
+
+```json
+{
+  "targets": [
+    {
+      "id": "airplay2.LivingRoom",
+      "name": "Living Room",
+      "host": "LivingRoom.local",
+      "port": 7000,
+      "password": "",
+      "txt": "features=0x4A7FCFD5,0x38174FDE flags=0x284 model=AppleTV6,2 srcvers=870.14.25 deviceid=AA:BB:CC:DD:EE:FF acl=0 fex=1c9/St5PFzg2IQw protovers=1.1"
+    }
+  ]
+}
+```
+
+- `id` — the synthetic output id; also the PipeWire sink name (`airplay2.LivingRoom`).
+- `name` — shown in the Output list as `AirPlay 2 (<name>)`.
+- `host` / `port` — the receiver; `host` may be an mDNS name or an IP.
+- `password` — the receiver's AirPlay password (may be empty).
+- `txt` — fallback AirPlay TXT record carrying the device `features`. The receiver's own `GET /info` plist supplies this automatically when reachable; the fallback is required when `/info` is refused. A wrong or missing feature set selects NTP timing and the stream `SETUP` fails (PTP timing is required).
+
+The bridge helper lives at `airplay-bridge` in this folder and is driven by the `player` script; you normally never call it directly.
 
 ## Stations & Favorites
 

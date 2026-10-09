@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+set -uo pipefail
+umask 077
+
+: "${XDG_RUNTIME_DIR:?SomaFM Bar requires XDG_RUNTIME_DIR}"
+runtime_dir="$XDG_RUNTIME_DIR/somafm-bar"
+data_root=${XDG_DATA_HOME:-$HOME/.local/share}
+config="$data_root/somafm-bar/airplay.json"
+state_file="$data_root/somafm-bar/state.json"
+bstate="$runtime_dir/airplay.json"
+fifo="$runtime_dir/airplay.fifo"
+blog="$runtime_dir/airplay.log"
+evlog="$runtime_dir/airplay-events.log"
+pidfile="$runtime_dir/airplay.pid"
+idle_stamp="$runtime_dir/airplay.idle"
+AIRPLAY_VOLUME=100
+BRIDGE_READY_TIMEOUT=25
+AIRPLAY_IDLE_GRACE=${SOMAFM_AIRPLAY_IDLE:-600}
+script_self=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
+
+install -d -m 700 "$runtime_dir" "$data_root/somafm-bar"
+
+warn() { printf '%s\n' "$*" >&2; }
+
+event() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >> "$evlog" 2>/dev/null || true; }
+
+field() {
+  local id=$1 key=$2 default=${3-}
+  jq -r --arg id "$id" --arg k "$key" --arg d "$default" \
+    '(.targets // [])[] | select(.id == $id) | (.[$k] // $d) | tostring' \
+    "$config" 2>/dev/null | head -n1
+}
+
+resolve_host() {
+  local host=$1
+  if [[ $host =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    printf '%s\n' "$host"
+    return 0
+  fi
+  local ip
+  ip=$(getent ahostsv4 "$host" 2>/dev/null | awk 'NR==1{print $1}')
+  if [[ -z $ip ]]; then
+    ip=$(getent ahostsv4 "$host." 2>/dev/null | awk 'NR==1{print $1}')
+  fi
+  [[ -n $ip ]] || { warn "Cannot resolve AirPlay host: $host"; return 1; }
+  printf '%s\n' "$ip"
+}
+
+fetch_features() {
+  local ip=$1 port=$2
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 - "$ip" "$port" <<'PY' 2>/dev/null
+import plistlib, socket, sys
+ip, port = sys.argv[1], int(sys.argv[2])
+try:
+    s = socket.create_connection((ip, port), timeout=5)
+    s.sendall(b"GET /info RTSP/1.0\r\nCSeq: 1\r\nUser-Agent: AirPlay/1.0\r\n\r\n")
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = s.recv(4096)
+        if not chunk:
+            raise SystemExit(1)
+        buf += chunk
+    head, body = buf.split(b"\r\n\r\n", 1)
+    length = 0
+    for line in head.split(b"\r\n"):
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":", 1)[1].strip())
+    while length and len(body) < length:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        body += chunk
+    info = plistlib.loads(body[:length] if length else body)
+    feat = info.get("features")
+    if isinstance(feat, int):
+        print("features=0x%x" % feat)
+except Exception:
+    raise SystemExit(1)
+PY
+}
+
+read_volume() {
+  local v
+  v=$(jq -r '(.volume // 70 | tonumber? // 70)' "$state_file" 2>/dev/null) || v=70
+  printf '%s\n' "$v"
+}
+
+bridge_pid() {
+  [[ -s $pidfile ]] || return 1
+  local pid
+  read -r pid < "$pidfile" || return 1
+  [[ $pid =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  printf '%s\n' "$pid"
+}
+
+running() {
+  bridge_pid >/dev/null 2>&1
+}
+
+current_id() {
+  [[ -f $bstate ]] || return 1
+  jq -r '.id // empty' "$bstate" 2>/dev/null
+}
+
+null_sink_module() {
+  local id=$1
+  [[ -n $id ]] || return 0
+  pactl list modules short 2>/dev/null \
+    | awk -v name="sink_name=$id " '$2 == "module-null-sink" && index($0, name) {print $1; exit}'
+}
+
+arm_idle() {
+  local token
+  token="$(date +%s%N)-$$-$RANDOM"
+  printf '%s\n' "$token" > "$idle_stamp"
+  setsid bash -c '
+    sleep "$1"
+    [[ "$(cat "$2" 2>/dev/null)" == "$3" ]] || exit 0
+    "$4" disconnect >/dev/null 2>&1
+  ' _ "$AIRPLAY_IDLE_GRACE" "$idle_stamp" "$token" "$script_self" >/dev/null 2>&1 &
+}
+
+disarm_idle() {
+  rm -f "$idle_stamp"
+}
+
+send_cmd() {
+  local data=$1
+  [[ -p $fifo ]] || return 1
+  timeout 2 sh -c 'cat > "$1"' _ "$fifo" <<<"$data" 2>/dev/null
+}
+
+teardown() {
+  local want=${1-}
+  local pid mid sid how=none
+  if pid=$(bridge_pid); then
+    send_cmd 'ACTION=STOP'
+    for _ in $(seq 1 60); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+    if kill -0 "$pid" 2>/dev/null; then
+      how=term
+      kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+      for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+      if kill -0 "$pid" 2>/dev/null; then
+        how=kill
+        kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+      fi
+    else
+      how=stop
+    fi
+  fi
+  [[ -n $want ]] || want=$(current_id)
+  [[ -n $want ]] && event "session-end how=$how id=$want"
+  mid=$(jq -r '.module_id // empty' "$bstate" 2>/dev/null || true)
+  [[ -n $mid ]] && pactl unload-module "$mid" >/dev/null 2>&1 || true
+  while sid=$(null_sink_module "$want"); [[ -n $sid ]]; do
+    pactl unload-module "$sid" >/dev/null 2>&1 || break
+  done
+  disarm_idle
+  rm -f "$pidfile" "$fifo" "$bstate"
+}
+
+cmd_start() {
+  local id=$1
+  [[ -n $id ]] || { warn 'AirPlay start needs a target id'; return 2; }
+  if running; then
+    if [[ $(current_id) == "$id" ]]; then
+      disarm_idle
+      send_cmd "START_UNIX_MS=$(date +%s%3N)"$'\nACTION=START' || true
+      return 0
+    fi
+    teardown "$(current_id)"
+  else
+    teardown "$id"
+  fi
+
+  local name host port password clibin feat ip mid pid
+  name=$(field "$id" name "AirPlay")
+  host=$(field "$id" host "")
+  port=$(field "$id" port "7000")
+  password=$(field "$id" password "")
+  clibin=$(field "$id" cliairplay "cliairplay")
+  [[ -n $host ]] || { warn "AirPlay target $id has no host"; return 2; }
+  command -v "$clibin" >/dev/null 2>&1 || [[ -x $clibin ]] || {
+    warn "cliairplay not found ($clibin); install it and run: sudo setcap cap_net_bind_service=+ep $clibin"
+    return 3
+  }
+
+  ip=$(resolve_host "$host") || return 3
+  feat=$(fetch_features "$ip" "$port" || true)
+  if [[ -z $feat ]]; then
+    feat=$(field "$id" txt "")
+  fi
+
+  mid=$(pactl load-module module-null-sink \
+    sink_name="$id" \
+    sink_properties="device.description=AirPlay 2 ($name)") 2>/dev/null
+  if [[ -z $mid ]]; then
+    warn "Could not create AirPlay sink for $id"
+    return 3
+  fi
+
+  : > "$blog"
+  rm -f "$fifo" "$pidfile"
+  mkfifo "$fifo"
+
+  AB_IP="$ip" AB_PORT="$port" AB_PW="$password" AB_CLI="$clibin" \
+  AB_SINK="$id" AB_FIFO="$fifo" AB_LOG="$blog" AB_PIDFILE="$pidfile" \
+  AB_VOL="$AIRPLAY_VOLUME" AB_FEAT="$feat" \
+  setsid bash -c '
+    echo $$ > "$AB_PIDFILE"
+    exec 9<> "$AB_FIFO"
+    args=(--protocol airplay2 --ap2-native --port "$AB_PORT" --volume "$AB_VOL" --cmdpipe "$AB_FIFO")
+    [[ -n $AB_FEAT ]] && args+=(--txt "$AB_FEAT")
+    [[ -n $AB_PW ]] && args+=(--password "$AB_PW")
+    parec --device="$AB_SINK.monitor" --format=s16le --rate=44100 --channels=2 2>>"$AB_LOG" \
+      | "$AB_CLI" "${args[@]}" "$AB_IP" >>"$AB_LOG" 2>&1
+  ' >/dev/null 2>&1 &
+
+  local waited=0 max=$((BRIDGE_READY_TIMEOUT * 5))
+  while (( waited < max )); do
+    if grep -aq 'Stream SETUP OK' "$blog" 2>/dev/null; then
+      break
+    fi
+    if (( waited > 10 )) && ! bridge_pid >/dev/null 2>&1; then
+      warn "AirPlay bridge failed to start (see $blog)"
+      teardown "$id"
+      return 4
+    fi
+    sleep 0.2
+    waited=$((waited + 1))
+  done
+  if ! grep -aq 'Stream SETUP OK' "$blog" 2>/dev/null; then
+    warn "AirPlay bridge did not become ready (see $blog)"
+    teardown "$id"
+    return 4
+  fi
+
+  send_cmd "START_UNIX_MS=$(date +%s%3N)"$'\nACTION=START' || true
+  jq -nc --arg id "$id" --argjson module_id "$mid" --arg sink "$id" \
+    --argjson pid "$(bridge_pid)" \
+    '{id:$id, module_id:$module_id, sink:$sink, pid:$pid}' > "$bstate"
+  disarm_idle
+  event "session-start id=$id ip=$ip src=$([[ -n $feat ]] && echo txt)"
+  return 0
+}
+
+cmd_stop() {
+  teardown
+  return 0
+}
+
+cmd_park() {
+  if running; then
+    send_cmd 'ACTION=STANDBY'
+    arm_idle
+    event "park id=$(current_id) grace=${AIRPLAY_IDLE_GRACE}s"
+  else
+    disarm_idle
+  fi
+  return 0
+}
+
+cmd_pause() {
+  running || return 0
+  send_cmd 'ACTION=PAUSE'
+}
+
+cmd_resume() {
+  running || return 0
+  disarm_idle
+  send_cmd "START_UNIX_MS=$(date +%s%3N)"$'\nACTION=START'
+}
+
+cmd_status() {
+  if running; then
+    jq -nc --arg id "$(current_id)" '{running:true, id:$id}' 2>/dev/null \
+      || printf '{"running":true,"id":"%s"}\n' "$(current_id)"
+  else
+    printf '{"running":false,"id":""}\n'
+  fi
+}
+
+case "${1:-status}" in
+  start) cmd_start "${2-}" ;;
+  stop) cmd_stop ;;
+  disconnect) cmd_stop ;;
+  park) cmd_park ;;
+  pause) cmd_pause ;;
+  resume) cmd_resume ;;
+  running) running ;;
+  status) cmd_status ;;
+  *) warn "Usage: airplay-bridge {start <id>|stop|disconnect|park|pause|resume|running|status}"; exit 2 ;;
+esac

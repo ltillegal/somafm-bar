@@ -37,6 +37,9 @@ station_name() {
 override_file="$data_root/somafm-bar/override.json"
 channels_cache="$data_root/somafm-bar/channels-cache.json"
 favorites_file="$data_root/somafm-bar/favorites.json"
+airplay_config="$data_root/somafm-bar/airplay.json"
+airplay_state="$runtime_dir/airplay.json"
+airplay_bridge_script="$script_dir/airplay-bridge"
 
 load_override() {
   [[ -f $override_file ]] || return 0
@@ -154,6 +157,66 @@ configured_output() {
   printf '%s\n' "$output"
 }
 
+resolve_output() {
+  local requested=${1-}
+  [[ -n $requested ]] || return 0
+  local available
+  available=$(list_outputs 2>/dev/null) || { printf '%s\n' "$requested"; return 0; }
+  [[ -n $available ]] || { printf '%s\n' "$requested"; return 0; }
+  if jq -e --arg r "$requested" 'any(.outputs[]; .id == $r)' \
+      <<< "$available" >/dev/null 2>&1; then
+    printf '%s\n' "$requested"
+    return 0
+  fi
+  local match
+  match=$(jq -r --arg r "$requested" '
+    ($r | capture("^(?<pre>.*?)(\\.([0-9]{1,3}\\.){3}[0-9]{1,3}\\.[0-9]+)?$").pre) as $pre
+    | [.outputs[] | select(.id == $pre or (.id | startswith($pre + ".")))][0].id // ""
+  ' <<< "$available" 2>/dev/null) || match=""
+  if [[ -n $match ]]; then printf '%s\n' "$match"; else printf '%s\n' "$requested"; fi
+}
+
+resolved_configured_output() {
+  resolve_output "$(configured_output)"
+}
+
+airplay_targets_json() {
+  [[ -f $airplay_config ]] || { printf '[]\n'; return 0; }
+  jq -c '[ (.targets // [])[] | select((.id | type) == "string")
+    | {id: .id, label: ("AirPlay 2 (" + ((.name // "AirPlay") | tostring) + ")")} ]' \
+    "$airplay_config" 2>/dev/null || printf '[]\n'
+}
+
+is_airplay_output() {
+  local id=${1-}
+  [[ -n $id && -f $airplay_config ]] || return 1
+  jq -e --arg id "$id" 'any((.targets // [])[]; .id == $id)' "$airplay_config" >/dev/null 2>&1
+}
+
+airplay_bridge() {
+  [[ -x $airplay_bridge_script ]] || return 1
+  "$airplay_bridge_script" "$@" 8>&-
+}
+
+airplay_running_id() {
+  [[ -f $airplay_state ]] || return 0
+  jq -r '.id // empty' "$airplay_state" 2>/dev/null
+}
+
+start_airplay_output() {
+  local id=${1-}
+  [[ -n $id ]] || return 0
+  is_airplay_output "$id" || return 0
+  if airplay_bridge running >/dev/null 2>&1 && [[ $(airplay_running_id) == "$id" ]]; then
+    airplay_bridge resume >/dev/null 2>&1 || true
+    return 0
+  fi
+  airplay_bridge start "$id" >/dev/null 2>&1 || {
+    echo 'AirPlay output could not be started' >&2
+    return 1
+  }
+}
+
 write_status() {
   local state=$1
   local temporary
@@ -185,7 +248,7 @@ send_command() {
 not_running_status() {
   jq -cn \
     --argjson volume "$(configured_volume)" \
-    --arg output "$(configured_output)" \
+    --arg output "$(resolved_configured_output)" \
     --arg station "$(station_name)" \
     '{running:false,paused:false,muted:false,title:"",volume:$volume,output:$output,loaded:false,error:"",errorDetail:"",station:{name:$station}}'
 }
@@ -268,8 +331,11 @@ start_player() {
     "$url"
   )
   local selected_output
-  selected_output=$(configured_output)
+  selected_output=$(resolved_configured_output)
   if [[ -n $selected_output ]]; then
+    if is_airplay_output "$selected_output" && ! start_airplay_output "$selected_output"; then
+      exit 4
+    fi
     player_arguments+=(--audio-device="pipewire/$selected_output")
   fi
   rm -f "$socket"
@@ -319,10 +385,20 @@ play() {
       exit 4
     }
   fi
+  local selected_output
+  selected_output=$(resolved_configured_output)
+  if is_airplay_output "$selected_output"; then
+    if [[ $(airplay_running_id) == "$selected_output" ]]; then
+      airplay_bridge resume >/dev/null 2>&1 || true
+    else
+      start_airplay_output "$selected_output" >/dev/null 2>&1 || true
+    fi
+  fi
   status
 }
 
 stop_player() {
+  airplay_bridge park >/dev/null 2>&1 || true
   if [[ ! -S $socket ]]; then
     if ! terminate_tracked_player; then
       echo 'Soma player could not be stopped' >&2
@@ -399,12 +475,16 @@ list_outputs() {
     echo 'Audio outputs are unavailable' >&2
     exit 3
   fi
-  printf '%s' "$sinks" | jq -c '[
-    .[] | select(type == "object" and (.name | type == "string"))
-    | .name as $id
-    | select($id | test("^([A-Za-z0-9._:+-]{1,160})$"))
-    | {id: $id, label: ((.description // $id) | tostring | gsub("[\\r\\n\\t]"; " ") | .[:160])}
-  ] | {outputs: .}'
+  printf '%s' "$sinks" | jq -c --argjson airplay "$(airplay_targets_json)" '
+    ($airplay | map(.id)) as $airplay_ids
+    | [
+        .[] | select(type == "object" and (.name | type == "string"))
+        | .name as $id
+        | select($id | test("^([A-Za-z0-9._:+-]{1,160})$"))
+        | select(($airplay_ids | index($id)) | not)
+        | {id: $id, label: ((.description // $id) | tostring | gsub("[\\r\\n\\t]"; " ") | .[:160])}
+      ] + $airplay
+    | {outputs: .}'
 }
 
 set_output() {
@@ -421,6 +501,19 @@ set_output() {
       echo 'Unknown audio output' >&2
       exit 3
     }
+  fi
+
+  local previous_airplay
+  previous_airplay=$(airplay_running_id)
+  if [[ -n $previous_airplay && $previous_airplay != "$requested" ]]; then
+    airplay_bridge disconnect >/dev/null 2>&1 || true
+  fi
+  if [[ -n $requested ]] && is_airplay_output "$requested" && [[ -S $socket ]]; then
+    if ! start_airplay_output "$requested" >/dev/null 2>&1; then
+      echo 'AirPlay output could not be started' >&2
+      status >/dev/null
+      exit 4
+    fi
   fi
 
   local temporary
@@ -552,11 +645,15 @@ case "$action" in
   toggle)
     if player_idle; then
       play
+    elif [[ $(status | jq -r '.paused' 2>/dev/null) == true ]]; then
+      play
     else
+      airplay_bridge pause >/dev/null 2>&1 || true
       player_command '{"command":["cycle","pause"]}'
     fi
     ;;
   pause)
+    airplay_bridge pause >/dev/null 2>&1 || true
     player_command '{"command":["set_property","pause",true]}'
     ;;
   stop)
