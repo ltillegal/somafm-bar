@@ -175,7 +175,7 @@ cmd_start() {
     teardown "$id"
   fi
 
-  local name host port password clibin feat ip mid pid
+  local name host port password clibin feat feat_src ip mid pid
   name=$(field "$id" name "AirPlay")
   host=$(field "$id" host "")
   port=$(field "$id" port "7000")
@@ -189,8 +189,11 @@ cmd_start() {
 
   ip=$(resolve_host "$host") || return 3
   feat=$(fetch_features "$ip" "$port" || true)
-  if [[ -z $feat ]]; then
+  if [[ -n $feat ]]; then
+    feat_src=info
+  else
     feat=$(field "$id" txt "")
+    feat_src=txt
   fi
 
   mid=$(pactl load-module module-null-sink \
@@ -245,7 +248,7 @@ cmd_start() {
     --argjson pid "$(bridge_pid)" \
     '{id:$id, module_id:$module_id, sink:$sink, pid:$pid}' > "$bstate"
   disarm_idle
-  event "session-start id=$id ip=$ip src=$([[ -n $feat ]] && echo txt)"
+  event "session-start id=$id ip=$ip src=$feat_src"
   return 0
 }
 

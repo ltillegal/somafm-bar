@@ -85,6 +85,16 @@ player_idle() {
     <<< "$response" >/dev/null 2>&1
 }
 
+player_paused() {
+  local response
+  response=$(printf '%s\n' '{"command":["get_property","pause"],"request_id":9003}' \
+    | socat -T 1 - "UNIX-CONNECT:$socket" 2>/dev/null \
+    | head -c "$((max_ipc_bytes + 1))") || return 1
+  (( $(printf '%s' "$response" | wc -c) <= max_ipc_bytes )) || return 1
+  jq -e 'select(.request_id == 9003 and .error == "success") | .data == true' \
+    <<< "$response" >/dev/null 2>&1
+}
+
 process_start_time() {
   local pid=$1
   [[ -r /proc/$pid/stat ]] || return 1
@@ -513,6 +523,9 @@ set_output() {
       echo 'AirPlay output could not be started' >&2
       status >/dev/null
       exit 4
+    fi
+    if player_idle || player_paused; then
+      airplay_bridge park >/dev/null 2>&1 || true
     fi
   fi
 
