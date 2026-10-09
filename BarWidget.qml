@@ -22,6 +22,8 @@ BarWidget {
   property int reportedVolume: 70
   property int pendingVolume: -1
   property bool statusReady: false
+  property string pendingAction: ""
+  property string pendingOutput: ""
 
   property var audioOutputs: []
   property string audioOutput: ""
@@ -93,9 +95,30 @@ BarWidget {
   }
 
   function runPlayerAction(action) {
-    if (actionProcess.running) return
+    if (actionProcess.running || outputProcess.running) {
+      root.pendingAction = action
+      return
+    }
     actionProcess.command = [root.playerPath, action]
     actionProcess.running = true
+  }
+
+  function pump() {
+    if (actionProcess.running || outputProcess.running) return
+    if (root.pendingVolume >= 0) { root.flushVolume(); return }
+    if (root.pendingAction !== "") {
+      var action = root.pendingAction
+      root.pendingAction = ""
+      actionProcess.command = [root.playerPath, action]
+      actionProcess.running = true
+      return
+    }
+    if (root.pendingOutput !== "") {
+      var id = root.pendingOutput
+      root.pendingOutput = ""
+      outputProcess.command = [root.playerPath, "output", id]
+      outputProcess.running = true
+    }
   }
 
   function loadOutputs() {
@@ -108,7 +131,10 @@ BarWidget {
   function selectOutput(id) {
     if (typeof id !== "string" || id === "") return
     if (id === root.audioOutput) return
-    if (outputProcess.running) return
+    if (outputProcess.running || actionProcess.running) {
+      root.pendingOutput = id
+      return
+    }
     outputProcess.command = [root.playerPath, "output", id]
     outputProcess.running = true
   }
@@ -223,20 +249,16 @@ BarWidget {
           if (root.pendingVolume === submittedVolume) {
             root.pendingVolume = -1
             root.playerVolume = submittedVolume
-          } else {
-            Qt.callLater(root.flushVolume)
-            return
           }
         } else {
           if (root.pendingVolume === submittedVolume) {
             root.pendingVolume = -1
             root.playerVolume = root.reportedVolume
-          } else {
-            Qt.callLater(root.flushVolume)
           }
         }
         submittedVolume = -1
       }
+      Qt.callLater(root.pump)
     }
   }
 
@@ -277,6 +299,7 @@ BarWidget {
     onExited: function(exitCode) {
       if (exitCode === 0) root.loadOutputs()
       root.refreshStatus()
+      Qt.callLater(root.pump)
     }
   }
 
