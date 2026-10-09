@@ -216,6 +216,9 @@ cmd_start() {
     [[ -n $AB_PW ]] && args+=(--password "$AB_PW")
     parec --device="$AB_SINK.monitor" --format=s16le --rate=44100 --channels=2 2>>"$AB_LOG" \
       | "$AB_CLI" "${args[@]}" "$AB_IP" >>"$AB_LOG" 2>&1
+    while m=$(pactl list modules short 2>/dev/null | grep -F module-null-sink | grep -F "sink_name=$AB_SINK " | cut -f1); [[ -n $m ]]; do
+      pactl unload-module "$m" >/dev/null 2>&1 || break
+    done
   ' >/dev/null 2>&1 &
 
   local waited=0 max=$((BRIDGE_READY_TIMEOUT * 5))
