@@ -260,7 +260,8 @@ not_running_status() {
     --argjson volume "$(configured_volume)" \
     --arg output "$(resolved_configured_output)" \
     --arg station "$(station_name)" \
-    '{running:false,paused:false,muted:false,title:"",volume:$volume,output:$output,loaded:false,error:"",errorDetail:"",station:{name:$station}}'
+    --arg url "$(station_url)" \
+    '{running:false,paused:false,muted:false,title:"",volume:$volume,output:$output,url:$url,loaded:false,error:"",errorDetail:"",station:{name:$station}}'
 }
 
 status() {
@@ -292,7 +293,7 @@ status() {
     return
   fi
 
-  printf '%s\n' "$(jq -sc --arg station "$(station_name)" '
+  printf '%s\n' "$(jq -sc --arg station "$(station_name)" --arg url "$(station_url)" '
     {
       running: (([.[] | select(.request_id == 6) | .data][0] // false) == false),
       paused: ([.[] | select(.request_id == 1) | .data][0] // false),
@@ -302,6 +303,7 @@ status() {
       volume: ([.[] | select(.request_id == 3) | .data][0] // 70),
       output: (([.[] | select(.request_id == 5) | .data][0] // "")
         | if type == "string" then (if . == "auto" then "" else sub("^pipewire/"; "") end) else "" end),
+      url: $url,
       loaded: true,
       error: "",
       errorDetail: "",

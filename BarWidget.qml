@@ -16,6 +16,15 @@ BarWidget {
   property bool playerRunning: false
   property bool playerPaused: false
   property bool playerMuted: false
+  readonly property bool playing: root.playerRunning && !root.playerPaused
+  property color playingColor: "#2ecc71"
+  property string streamUrl: ""
+  readonly property string qualityText: {
+    var url = root.streamUrl
+    if (typeof url !== "string" || url === "") return ""
+    var match = url.match(/[-_]([0-9]{1,4})[-_]([a-zA-Z0-9]+)(?:[?#]|$)/)
+    return match ? match[1] + " kbps " + match[2].toUpperCase() : ""
+  }
   property string playerTitle: ""
   property string stationName: "SomaFM"
   property int playerVolume: 70
@@ -28,6 +37,7 @@ BarWidget {
   property var audioOutputs: []
   property string audioOutput: ""
   property string outputsBuffer: ""
+  property string statusBuffer: ""
 
   property var allStations: []
   property var favStations: []
@@ -66,6 +76,8 @@ BarWidget {
       if (root.pendingVolume < 0) root.playerVolume = root.reportedVolume
       root.playerTitle = root.singleLineText(
         state.title || "", 160)
+      var nextUrl = root.singleLineText(state.url || "", 200)
+      if (nextUrl !== "") root.streamUrl = nextUrl
       root.audioOutput = root.singleLineText(state.output, 160)
       var station = root.singleLineText(state.station && state.station.name, 80)
       if (station !== "") root.stationName = station
@@ -231,8 +243,16 @@ BarWidget {
   Process {
     id: statusProcess
     command: []
+    stdout: SplitParser {
+      onRead: function(line) { root.statusBuffer += line }
+    }
     onExited: function(exitCode) {
-      if (exitCode === 0) root.statusReady = true
+      var buffer = root.statusBuffer
+      root.statusBuffer = ""
+      if (exitCode === 0) {
+        root.statusReady = true
+        root.applyPlayerState(buffer)
+      }
     }
   }
 
@@ -403,10 +423,12 @@ BarWidget {
     anchors.fill: parent
     bar: root.bar
     text: "\uf001"
-    active: root.playerRunning && !root.playerPaused
+    active: root.playing
+    activeColor: root.playingColor
     tooltipText: root.playerRunning
       ? (root.playerPaused ? "Soma paused: " : "Soma playing: ")
         + root.safeTooltipText(root.playerTitle)
+        + (root.qualityText !== "" ? "  ·  " + root.qualityText : "")
         + "  ·  " + root.playerVolume + "%"
       : root.stationName
 
@@ -479,10 +501,11 @@ BarWidget {
           width: popupColumn.width
           text: root.playerRunning
             ? (root.playerPaused ? "Paused" : "Playing")
+              + (root.qualityText !== "" ? "  ·  " + root.qualityText : "")
               + (root.playerMuted ? "  ·  muted" : "  ·  " + root.playerVolume + "%")
             : "Stopped — press Play to start"
           textFormat: Text.PlainText
-          color: Color.foreground
+          color: root.playing ? root.playingColor : Color.foreground
           opacity: 0.65
           font.family: Style.font.family
           font.pixelSize: Style.font.bodySmall
@@ -493,9 +516,10 @@ BarWidget {
           spacing: Style.spacing.controlGap
 
           Button {
-iconText: root.playerRunning && !root.playerPaused ? "\uf04c" : "\uf04b"
-            text: root.playerRunning && !root.playerPaused ? "Pause" : "Play"
-            active: root.playerRunning && !root.playerPaused
+            iconText: root.playing ? "\uf04c" : "\uf04b"
+            text: root.playing ? "Pause" : "Play"
+            active: root.playing
+            foreground: root.playing ? root.playingColor : Color.foreground
             onClicked: root.runPlayerAction(root.playerRunning ? "toggle" : "play")
           }
 

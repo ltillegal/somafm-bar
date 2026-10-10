@@ -6,9 +6,10 @@ Bar widget for [Omarchy](https://omarchy.org/) that plays a SomaFM station throu
 
 ## What it does
 
-- A note icon in the bar, lit while the station is playing.
+- A note icon in the bar that turns green while the station is playing.
 - Left-click opens the popup card under the icon — nothing starts playing until you press **Play**.
-- Popup card: current track title, Play/Pause, Stop, a volume slider, and the list of audio outputs.
+- Popup card: current track title, Play/Pause (highlighted green while playing), Stop, a volume slider, and the list of audio outputs.
+- The playback state and the stream quality (for example `128 kbps MP3`, parsed from the station URL) are shown in the card and in the bar tooltip.
 - Copy button next to the title puts the current track title on the clipboard and closes the card.
 - Right-click the bar icon stops playback, middle-click toggles play/pause, scroll wheel changes volume in 5% steps.
 - The popup closes on outside click or `Esc`.

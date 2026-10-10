@@ -27,6 +27,7 @@ local function do_write()
     volume = mp.get_property_number('volume') or 70,
     title = tostring(mp.get_property('media-title') or ''):gsub('[%c]', ' '),
     output = current_output(),
+    url = tostring(mp.get_property('path') or ''):gsub('[%c]', ' '):sub(1, 200),
     error = '',
     errorDetail = '',
     station = { name = station }
@@ -55,6 +56,7 @@ local function schedule()
 end
 
 mp.observe_property('media-title', 'native', schedule)
+mp.observe_property('path', 'string', schedule)
 mp.observe_property('pause', 'bool', schedule)
 mp.observe_property('mute', 'bool', schedule)
 mp.observe_property('volume', 'number', schedule)
