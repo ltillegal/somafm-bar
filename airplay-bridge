@@ -162,7 +162,7 @@ teardown() {
 }
 
 cmd_start() {
-  local id=$1
+  local id=$1 mode=${2-sync}
   [[ -n $id ]] || { warn 'AirPlay start needs a target id'; return 2; }
   if running; then
     if [[ $(current_id) == "$id" ]]; then
@@ -224,7 +224,29 @@ cmd_start() {
     done
   ' >/dev/null 2>&1 &
 
-  local waited=0 max=$((BRIDGE_READY_TIMEOUT * 5))
+  local waited=0
+  while (( waited < 25 )) && ! bridge_pid >/dev/null 2>&1; do
+    sleep 0.04
+    waited=$((waited + 1))
+  done
+  if ! bridge_pid >/dev/null 2>&1; then
+    warn "AirPlay bridge failed to start (see $blog)"
+    teardown "$id"
+    return 4
+  fi
+
+  jq -nc --arg id "$id" --argjson module_id "$mid" --arg sink "$id" \
+    --argjson pid "$(bridge_pid)" \
+    '{id:$id, module_id:$module_id, sink:$sink, pid:$pid}' > "$bstate"
+  disarm_idle
+
+  if [[ $mode == async ]]; then
+    setsid "$script_self" _ready "$id" "$ip" "$feat_src" "$(bridge_pid)" >/dev/null 2>&1 &
+    return 0
+  fi
+
+  waited=0
+  local max=$((BRIDGE_READY_TIMEOUT * 5))
   while (( waited < max )); do
     if grep -aq 'Stream SETUP OK' "$blog" 2>/dev/null; then
       break
@@ -244,12 +266,42 @@ cmd_start() {
   fi
 
   send_cmd "START_UNIX_MS=$(date +%s%3N)"$'\nACTION=START' || true
-  jq -nc --arg id "$id" --argjson module_id "$mid" --arg sink "$id" \
-    --argjson pid "$(bridge_pid)" \
-    '{id:$id, module_id:$module_id, sink:$sink, pid:$pid}' > "$bstate"
-  disarm_idle
   event "session-start id=$id ip=$ip src=$feat_src"
   return 0
+}
+
+# Background readiness waiter for `start-async`. Writes the session-start
+# event once cliairplay reports "Stream SETUP OK", or tears the session down if
+# it never becomes ready. Detached so the caller returns immediately and the
+# ~7s AP2/PTP handshake no longer blocks the UI.
+cmd_ready() {
+  local id=$1 ip=${2-} src=${3-} want_pid=${4-}
+  [[ -n $id ]] || return 0
+  local waited=0 max=$((BRIDGE_READY_TIMEOUT * 5)) cur
+  while (( waited < max )); do
+    if grep -aq 'Stream SETUP OK' "$blog" 2>/dev/null; then
+      disarm_idle
+      send_cmd "START_UNIX_MS=$(date +%s%3N)"$'\nACTION=START' || true
+      event "session-start id=$id ip=$ip src=$src"
+      return 0
+    fi
+    cur=$(bridge_pid 2>/dev/null || true)
+    if [[ -n $want_pid && $cur != "$want_pid" ]]; then
+      return 0
+    fi
+    if (( waited > 10 )) && [[ -z $cur ]]; then
+      break
+    fi
+    sleep 0.2
+    waited=$((waited + 1))
+  done
+  cur=$(bridge_pid 2>/dev/null || true)
+  if [[ -z $want_pid || $cur == "$want_pid" ]]; then
+    warn "AirPlay bridge did not become ready (see $blog)"
+    teardown "$id"
+    event "session-fail id=$id"
+  fi
+  return 1
 }
 
 cmd_stop() {
@@ -290,6 +342,8 @@ cmd_status() {
 
 case "${1:-status}" in
   start) cmd_start "${2-}" ;;
+  start-async) cmd_start "${2-}" async ;;
+  _ready) cmd_ready "${2-}" "${3-}" "${4-}" "${5-}" ;;
   stop) cmd_stop ;;
   disconnect) cmd_stop ;;
   park) cmd_park ;;

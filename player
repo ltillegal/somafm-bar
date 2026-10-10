@@ -221,7 +221,7 @@ start_airplay_output() {
     airplay_bridge resume >/dev/null 2>&1 || true
     return 0
   fi
-  airplay_bridge start "$id" >/dev/null 2>&1 || {
+  airplay_bridge start-async "$id" >/dev/null 2>&1 || {
     echo 'AirPlay output could not be started' >&2
     return 1
   }
@@ -515,9 +515,6 @@ set_output() {
 
   local previous_airplay
   previous_airplay=$(airplay_running_id)
-  if [[ -n $previous_airplay && $previous_airplay != "$requested" ]]; then
-    airplay_bridge disconnect >/dev/null 2>&1 || true
-  fi
   if [[ -n $requested ]] && is_airplay_output "$requested" && [[ -S $socket ]]; then
     if ! start_airplay_output "$requested" >/dev/null 2>&1; then
       echo 'AirPlay output could not be started' >&2
@@ -546,6 +543,17 @@ set_output() {
         echo 'Audio output could not be changed' >&2
         exit 4
       fi
+    fi
+  fi
+
+  # Tear the old AirPlay session down only after mpv has been moved off its
+  # sink. Disconnecting first unloads the sink out from under the playing
+  # mpv, which makes mpv pause; switching the device first keeps playback.
+  if [[ -n $previous_airplay && $previous_airplay != "$requested" ]]; then
+    local running_now
+    running_now=$(airplay_running_id)
+    if [[ $running_now == "$previous_airplay" ]]; then
+      airplay_bridge disconnect >/dev/null 2>&1 || true
     fi
   fi
   status
