@@ -1,0 +1,57 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to attach assets to (vX.Y.Z)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  bundle:
+    name: plugin bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version from manifest
+        id: meta
+        run: |
+          PLUGIN_ID=$(python3 -c "import json;print(json.load(open('manifest.json'))['id'])")
+          VERSION=$(python3 -c "import json;print(json.load(open('manifest.json'))['version'])")
+          echo "id=$PLUGIN_ID" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Bundle plugin
+        run: |
+          PLUGIN_ID="${{ steps.meta.outputs.id }}"
+          VERSION="${{ steps.meta.outputs.version }}"
+          mkdir -p "bundle/$PLUGIN_ID"
+          tar -cf - \
+            --exclude=.git \
+            --exclude=.github \
+            --exclude=bundle \
+            . | tar -xf - -C "bundle/$PLUGIN_ID"
+
+      - name: Create archive
+        run: |
+          PLUGIN_ID="${{ steps.meta.outputs.id }}"
+          VERSION="${{ steps.meta.outputs.version }}"
+          tar -czf "somafm-bar-${VERSION}.tar.gz" -C bundle "$PLUGIN_ID"
+          sha256sum somafm-bar-*.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          tar -tzf "somafm-bar-${VERSION}.tar.gz" | head -20
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          files: |
+            somafm-bar-*.tar.gz
+            SHA256SUMS.txt
