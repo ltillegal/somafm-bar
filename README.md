@@ -1,6 +1,6 @@
 # SomaFM Bar
 
-[![Donate](https://img.shields.io/badge/Donate-PayPal-00457C?logo=paypal&logoColor=white)](https://www.paypal.com/ncp/payment/MAMKZM5TTVN5U)
+[![Donate](https://img.shields.io/badge/Donate-PayPal-00457C?logo=paypal&logoColor=white)](https://www.paypal.com/ncp/payment/MAMKZM5TTVN5U?locale.x=en_US&country.x=US)
 
 Bar widget for [Omarchy](https://omarchy.org/) that plays a SomaFM station through `mpv`, with a popup card for playback control.
 
@@ -267,6 +267,6 @@ MIT — see [LICENSE](LICENSE).
 
 If this project is useful, you can support development via PayPal:
 
-[![Donate](https://img.shields.io/badge/Donate-PayPal-00457C?logo=paypal&logoColor=white)](https://www.paypal.com/ncp/payment/MAMKZM5TTVN5U)
+[![Donate](https://img.shields.io/badge/Donate-PayPal-00457C?logo=paypal&logoColor=white)](https://www.paypal.com/ncp/payment/MAMKZM5TTVN5U?locale.x=en_US&country.x=US)
 
-PayPal: [Donate](https://www.paypal.com/ncp/payment/MAMKZM5TTVN5U)
+PayPal: [Donate](https://www.paypal.com/ncp/payment/MAMKZM5TTVN5U?locale.x=en_US&country.x=US)
