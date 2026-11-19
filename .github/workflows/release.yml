@@ -47,6 +47,11 @@ jobs:
           cat SHA256SUMS.txt
           tar -tzf "somafm-bar-${VERSION}.tar.gz" | head -20
 
+      - name: Verify checksum
+        run: |
+          set -euo pipefail
+          sha256sum -c SHA256SUMS.txt
+
       - name: Publish release assets
         uses: softprops/action-gh-release@v2
         with:

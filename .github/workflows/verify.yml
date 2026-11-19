@@ -1,0 +1,86 @@
+name: verify
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell syntax
+        run: |
+          set -euo pipefail
+          find . -type f \( -name '*.sh' -o -name 'player' -o -name 'fun-bridge' -o -name 'airplay-bridge' \) \
+            -not -path './.git/*' -print0 | xargs -0 -r -n1 bash -n
+          echo "shell syntax ok"
+
+      - name: JSON and YAML
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet pyyaml
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          import yaml
+
+          problems = []
+          for path in pathlib.Path('.').rglob('*'):
+              if not path.is_file() or '.git' in path.parts:
+                  continue
+              if path.suffix in {'.yaml', '.yml'}:
+                  try:
+                      yaml.safe_load(path.read_text(encoding='utf-8'))
+                  except Exception as exc:
+                      problems.append(f'{path}: {exc}')
+              elif path.suffix == '.json':
+                  try:
+                      json.loads(path.read_text(encoding='utf-8'))
+                  except Exception as exc:
+                      problems.append(f'{path}: {exc}')
+
+          if problems:
+              print('\n'.join(problems), file=sys.stderr)
+              sys.exit(1)
+          print('JSON/YAML ok')
+          PY
+
+      - name: Manifest entry points
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          manifest = json.loads(Path('manifest.json').read_text(encoding='utf-8'))
+          for kind, name in manifest['entryPoints'].items():
+              path = Path(name)
+              if not path.is_file():
+                  raise SystemExit(f'{kind} entry point missing: {path}')
+              print(f'{kind}: {path} ok')
+          PY
+
+      - name: English-only text guard
+        run: python3 tools/check_english.py
+
+      - name: Donation link guard
+        run: |
+          set -euo pipefail
+          URL='https://www.paypal.com/ncp/payment/MAMKZM5TTVN5U?locale.x=en_US&country.x=US'
+          grep -qF "$URL" README.md
+          grep -qF "$URL" .github/FUNDING.yml
+          PLAIN='paypal\.com/ncp/payment/MAMKZM5TTVN5U([^?]|$)'
+          if grep -RInE "$PLAIN" --exclude-dir=.git --exclude=verify.yml .; then
+            echo 'plain PayPal URL found' >&2
+            exit 1
+          fi
+          echo 'donation links ok'
